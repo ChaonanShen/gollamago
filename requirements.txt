@@ -7,4 +7,4 @@ huggingface_hub[cli]
 # Optional: install ninetoothed for --backend ninetoothed, or TileLang for
 # --backend tilelang. The bundled MACA C++ backend is built separately.
 # ninetoothed
-# tilelang
+tilelang==0.1.14

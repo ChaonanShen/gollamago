@@ -80,7 +80,7 @@ def configure_backend(
 
     if backend == "tilelang":
         try:
-            target_utils = importlib.import_module("tilelang.utils.target")
+            target_utils = importlib.import_module("tilelang.backend.target")
             resolved_target = str(target_utils.determine_target(resolved_target))
         except (ImportError, OSError) as error:
             warnings.warn(f"TileLang is unavailable ({error}); using torch", RuntimeWarning)
