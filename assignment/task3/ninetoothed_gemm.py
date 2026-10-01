@@ -20,19 +20,35 @@ else:
 
 
 def arrangement(lhs, rhs, output):
-    # TODO(student): tile and align lhs, rhs, and output for blocked GEMM.
-    raise NotImplementedError("Complete arrangement().")
+    """Map each output tile to an lhs tile row and an rhs tile column."""
+    output_arranged = output.tile((BLOCK_SIZE_M, BLOCK_SIZE_N))
+
+    lhs_arranged = lhs.tile((BLOCK_SIZE_M, BLOCK_SIZE_K))
+    lhs_arranged = lhs_arranged.tile((1, -1))
+    lhs_arranged = lhs_arranged.expand((-1, output_arranged.shape[1]))
+    lhs_arranged.dtype = lhs_arranged.dtype.squeeze(0)
+
+    rhs_arranged = rhs.tile((BLOCK_SIZE_K, BLOCK_SIZE_N))
+    rhs_arranged = rhs_arranged.tile((-1, 1))
+    rhs_arranged = rhs_arranged.expand((output_arranged.shape[0], -1))
+    rhs_arranged.dtype = rhs_arranged.dtype.squeeze(1)
+
+    return lhs_arranged, rhs_arranged, output_arranged
 
 
 def application(lhs, rhs, output):
-    # TODO(student): accumulate ntl.dot over K tiles and write the output.
-    raise NotImplementedError("Complete application().")
+    accumulator = ntl.zeros(output.shape, dtype=ntl.float32)
+    for k in range(lhs.shape[0]):
+        accumulator += ntl.dot(lhs[k], rhs[k])
+    output = accumulator
 
 
 _KERNEL = ninetoothed.make(
     arrangement,
     application,
-    (Tensor(2), Tensor(2), Tensor(2)),
+    # Masked input loads use zero so a partial K tile contributes no padding.
+    # NineToothed also masks stores outside the output matrix.
+    (Tensor(2, other=0), Tensor(2, other=0), Tensor(2)),
 )
 
 

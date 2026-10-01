@@ -8,6 +8,9 @@ SIZES = [2**i for i in range(3, 13)]
 
 
 if __name__ == "__main__":
+    # Match the exercise's float32 accumulation requirement in the baseline.
+    # cuBLAS may otherwise truncate partial sums to float16 for some shapes.
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.manual_seed(0)
     print("M=N=K\tcorrect\tNineToothed(ms)\tPyTorch(ms)")
 

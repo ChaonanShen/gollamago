@@ -43,5 +43,7 @@ python benchmark_ninetoothed_gemm.py
 NINETOOTHED_AUTOTUNE=1 python benchmark_ninetoothed_gemm.py
 ```
 
-测试使用 `M=N=K=512`；benchmark 对 `M=N=K=2^3` 到 `2^12` 的规模比较九齿与
-`torch.mm` 的耗时。提交完成的 `ninetoothed_gemm.py`的测试输出和基线性能数据截图。
+测试覆盖 512 和 2048 方阵、矩形、非整块边界与转置输入；benchmark 对 `M=N=K=2^3` 到 `2^12` 的规模比较九齿与
+`torch.mm` 的耗时。测试和 benchmark 关闭 PyTorch 的
+`allow_fp16_reduced_precision_reduction`，使参考实现也采用 float32 累加；
+否则部分尺寸的 cuBLAS 半精度中间归约会引入额外误差。提交完成的 `ninetoothed_gemm.py`的测试输出和基线性能数据截图。
