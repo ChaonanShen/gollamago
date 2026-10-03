@@ -118,9 +118,9 @@ class Attention(nn.Module):
 
     def forward(self, hidden_states, sin_table, cos_table):
         batch_size, seq_len = hidden_states.shape[:2]
-        hidden_shape = (batch_size, seq_len, -1, self.head_dim)
+        hidden_shape = (batch_size, seq_len, -1, self.head_dim) # (B, S, H, D)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape)
+        query_states = self.q_proj(hidden_states).view(hidden_shape) 
         key_states = self.k_proj(hidden_states).view(hidden_shape)
         value_states = self.v_proj(hidden_states).view(hidden_shape).permute(0, 2, 1, 3)
 
@@ -152,6 +152,7 @@ class DecoderLayer(nn.Module):
 
         self.mlp = MLP(config.hidden_size, config.intermediate_size)
 
+    # hidden_states [B, S, D], D=2048
     def forward(self, hidden_states, sin_table, cos_table):
         hidden_states += self.self_attn(
             self.input_layernorm(hidden_states), sin_table, cos_table
@@ -168,6 +169,8 @@ def generate_sin_and_cos_tables(seq_len, emb_dim, base, dtype, device):
     )
 
     positions = torch.arange(seq_len, dtype=dtype, device=device).unsqueeze(1)
+    # theta:(D//2,)  positions:(S, 1)
+    # sin_table/cos_table: (S, D//2)
     sin_table = torch.sin(positions * theta)
     cos_table = torch.cos(positions * theta)
 
@@ -205,6 +208,7 @@ class Model(nn.Module):
 
         seq_len = hidden_states.shape[1]
 
+        # TODO: 每次forward都重新计算一次，虽然每次都是所有layers共用，但还是太浪费了吧
         sin_table, cos_table = generate_sin_and_cos_tables(
             seq_len,
             self.head_dim,
