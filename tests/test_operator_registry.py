@@ -9,10 +9,10 @@ def test_torch_operators_match_references():
     input = torch.randn(2, 3, 8)
     weight = torch.randn(8)
 
-    rms = operators.get_operator("rms_norm", "torch")
+    actual = operators.dispatch("rms_norm", input, weight, 1e-5, backend="torch")
 
     torch.testing.assert_close(
-        rms(input, weight, 1e-5),
+        actual,
         input * torch.rsqrt(input.pow(2).mean(-1, keepdim=True) + 1e-5) * weight,
     )
 

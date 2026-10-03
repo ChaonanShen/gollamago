@@ -124,6 +124,18 @@ rope(input, sin_table, cos_table) -> output
 
 ## 测试和性能
 
+加载项目环境后，可以单独验证 TileLang RMSNorm 和 RoPE，不需要模型权重：
+
+```shell
+RUN_ACCELERATOR_TESTS=1 python -m pytest -q tests/test_backend_integration.py -k tilelang
+```
+
+这些 TileLang 测试通过 `operators.dispatch` 分别调用 TileLang 算子和 PyTorch 参考实现，
+同时检查算子注册状态；回退到 PyTorch 的警告会让测试失败。RoPE 覆盖 Q/K 的 head 数、单 token 与多 batch/sequence、
+FP32/FP16/BF16，以及恒等旋转和 90 度旋转。TileLang RMSNorm 同样覆盖单 token、多 batch/sequence
+和三种精度，并检查输入及 weight 未被修改。MACA 和 NineToothed RMSNorm 测试也会检查注册并拒绝回退。
+未设置 `RUN_ACCELERATOR_TESTS=1` 时会跳过加速器测试。
+
 下面提供轻量性能对比，统一生成 16 个 token，使用 1 次 warmup、3 次测量，并保持模型、
 prompt、seed、精度和设备完全一致。该配置用于快速反馈，结果波动较大，不作为正式性能结论。
 下面命令假设在 MACA 机器上运行，模型目录是 `models/Llama-3.2-1B`。
