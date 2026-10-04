@@ -24,6 +24,10 @@ def create_parser():
         help="List of prompts for text generation.",
     )
     parser.add_argument(
+        "--batch-size", type=int,
+        help="Repeat a single prompt to this batch size; multiple prompts must match this count.",
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=64,
@@ -69,6 +73,18 @@ def create_parser():
     return parser
 
 
+def expand_prompts(prompts, batch_size):
+    if batch_size is None:
+        return prompts
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if len(prompts) == 1:
+        return prompts * batch_size
+    if len(prompts) != batch_size:
+        raise ValueError("--batch-size must match the number of prompts when multiple prompts are given")
+    return prompts
+
+
 def configure_tokenizer(tokenizer):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -88,7 +104,10 @@ def main(argv=None):
         parser.error("--num-profiling-iterations must be positive")
 
     model_path = args.model
-    prompts = args.prompts
+    try:
+        prompts = expand_prompts(args.prompts, args.batch_size)
+    except ValueError as error:
+        parser.error(str(error))
     max_new_tokens = args.max_new_tokens
     device = args.device
     num_warmup_iterations = args.num_warmup_iterations

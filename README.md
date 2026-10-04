@@ -198,6 +198,11 @@ JIT 编译和输入生成不计时；批量同步计时包含 dispatch、输出�
 Torch baseline 是本仓库的 eager 参考实现；其多次 kernel 启动与中间张量开销也包含在计时内。
 算子未注册或回退时直接失败。
 
+整体推理也支持 `--batch-size`：给一个 prompt 时会复制为指定数量的请求；给多个
+prompt 时，数量必须与指定 batch 一致。不指定该参数时，batch 等于 `--prompts` 的数量。
+批量比较需保持两组 batch、prompt 和生成长度相同。16GB 容量能否满足取决于这些参数，
+应以 `peak_memory_mib` 实测为准。
+
 下面提供轻量性能对比，统一生成 16 个 token，使用 1 次 warmup、3 次测量，并保持模型、
 prompt、seed、精度和设备完全一致。该配置用于快速反馈，结果波动较大，不作为正式性能结论。
 下面命令假设在 MACA 机器上运行，模型目录是 `models/Llama-3.2-1B`。
