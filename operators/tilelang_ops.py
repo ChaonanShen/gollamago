@@ -96,6 +96,7 @@ register_operator("tilelang", "rms_norm", rms_norm)
 @functools.lru_cache(maxsize=None)
 def _compile_rope(heads: int, head_dim: int, dtype: str, target: str):
     # llama3.2-1B的head_dim=64
+    # 所以分块可以更多些，每行处理BR, BS
 
     import tilelang 
     import tilelang.language as T 
@@ -103,8 +104,8 @@ def _compile_rope(heads: int, head_dim: int, dtype: str, target: str):
     B = T.dynamic("B")
     S = T.dynamic("S")
 
-    # BR = 4 # 一个block处理BR行 
-    # BS = 4
+    BR = 4 # 一个block处理BR行 
+    BS = 64
 
     @tilelang.jit(target=target, out_idx=[-1])
     def kernel():
@@ -115,29 +116,31 @@ def _compile_rope(heads: int, head_dim: int, dtype: str, target: str):
             cos_table: T.Tensor((S, head_dim//2), dtype),
             output: T.Tensor((B, S, heads, head_dim), dtype)
         ):
-            with T.Kernel(B, S, heads, threads=128) as (r, s, h):
+            with T.Kernel(T.ceildiv(B, BR), T.ceildiv(S, BS), heads, threads=128) as (br, bs, h):
+                r = br * BR 
+                s = bs * BS 
                 
-                first_half = T.alloc_fragment((head_dim//2,), T.float32)
-                second_half = T.alloc_fragment((head_dim//2,), T.float32)
+                first_half = T.alloc_fragment((BR, BS, head_dim//2,), T.float32)
+                second_half = T.alloc_fragment((BR, BS, head_dim//2,), T.float32)
 
                 # 复制
-                for d in T.Parallel(head_dim//2):
-                    first_half[d] = input[r, s, h, d]
-                    second_half[d] = input[r, s, h, d+head_dim//2]
+                for i, j, d in T.Parallel(BR, BS, head_dim//2):
+                    first_half[i, j, d] = input[r+i, s+j, h, d]
+                    second_half[i, j, d] = input[r+i, s+j, h, d+head_dim//2]
 
                 # 计算
-                for d in T.Parallel(head_dim//2):
+                for i, j, d in T.Parallel(BR, BS, head_dim//2):
                     # 每一行D，乘以各自位置的sin/cos就行
-                    sin = T.cast(sin_table[s, d], T.float32)
-                    cos = T.cast(cos_table[s, d], T.float32)
-                    first = first_half[d]
-                    second = second_half[d]
-                    first_half[d] = first * cos - second * sin
-                    second_half[d] = first * sin + second * cos
+                    sin = T.cast(sin_table[s+j, d], T.float32)
+                    cos = T.cast(cos_table[s+j, d], T.float32)
+                    first = first_half[i, j, d]
+                    second = second_half[i, j, d]
+                    first_half[i, j, d] = first * cos - second * sin
+                    second_half[i, j, d] = first * sin + second * cos
 
-                for d in T.Parallel(head_dim//2):
-                    output[r, s, h, d] = first_half[d]
-                    output[r, s, h, d+head_dim//2] = second_half[d]
+                for i, j, d in T.Parallel(BR, BS, head_dim//2):
+                    output[r+i, s+j, h, d] = first_half[i, j, d]
+                    output[r+i, s+j, h, d+head_dim//2] = second_half[i, j, d]
 
         return main
     
