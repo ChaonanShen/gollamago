@@ -76,6 +76,24 @@ def timed(function, device, warmup, repeat):
     return (time.perf_counter() - start) * 1e6 / repeat
 
 
+
+def assert_close_chunked(actual, expected, *, rtol, atol, chunk_elements=1 << 20, max_error=False):
+    """Validate all elements with bounded temporary memory, outside timing."""
+    if actual.shape != expected.shape:
+        raise AssertionError(f"shape mismatch: {actual.shape} != {expected.shape}")
+    if chunk_elements <= 0:
+        raise ValueError("chunk_elements must be positive")
+    actual_flat, expected_flat = actual.reshape(-1), expected.reshape(-1)
+    error = 0.0
+    for start in range(0, actual.numel(), chunk_elements):
+        a = actual_flat[start:start + chunk_elements]
+        e = expected_flat[start:start + chunk_elements]
+        torch.testing.assert_close(a, e, rtol=rtol, atol=atol)
+        if max_error:
+            error = max(error, (a.float() - e.float()).abs().max().item())
+    return error
+
+
 def benchmark_case(name, tensors, backend, device, warmup, repeat, model_name, role=""):
     torch_call = lambda: operators.dispatch(name, *tensors, backend="torch")
     backend_call = lambda: operators.dispatch(name, *tensors, backend=backend)
@@ -86,11 +104,10 @@ def benchmark_case(name, tensors, backend, device, warmup, repeat, model_name, r
     actual = backend_call()
     torch.cuda.synchronize(device)
     rtol, atol = TOLERANCES[name][tensors[0].dtype]
-    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    max_error = assert_close_chunked(actual, expected, rtol=rtol, atol=atol, max_error=True)
     for value, saved in zip(tensors, before):
         if isinstance(value, torch.Tensor):
-            torch.testing.assert_close(value, saved, rtol=0, atol=0)
-    max_error = (actual.float() - expected.float()).abs().max().item()
+            assert_close_chunked(value, saved, rtol=0, atol=0)
     del actual, expected, before
 
     torch_us = timed(torch_call, device, warmup, repeat)
@@ -113,11 +130,11 @@ def create_parser():
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--models", nargs="+", choices=MODEL_PROFILES,
-        default=list(MODEL_PROFILES), help="real model profiles; Llama-3.2-1B is listed first",
+        default=["llama3.2-1b"], help="default: Llama-3.2-1B; other profiles remain selectable",
     )
     parser.add_argument("--dtype", choices=DTYPES, help="override the model's default BF16 dtype")
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--seq-lens", nargs="+", type=int, default=[1, 128, 512, 2048])
+    parser.add_argument("--seq-lens", nargs="+", type=int, default=[128, 512, 2048, 4906])
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=100)
     return parser

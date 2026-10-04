@@ -80,7 +80,13 @@ def configure_backend(
 
     if backend == "tilelang":
         try:
-            target_utils = importlib.import_module("tilelang.backend.target")
+            try:
+                target_utils = importlib.import_module("tilelang.backend.target")
+            except ModuleNotFoundError as error:
+                # MACA TileLang 0.1.9 keeps this helper under utils.
+                if error.name not in ("tilelang.backend", "tilelang.backend.target"):
+                    raise
+                target_utils = importlib.import_module("tilelang.utils.target")
             resolved_target = str(target_utils.determine_target(resolved_target))
         except (ImportError, OSError) as error:
             warnings.warn(f"TileLang is unavailable ({error}); using torch", RuntimeWarning)

@@ -18,19 +18,45 @@ def test_torch_backend_accepts_cpu():
     assert config.tilelang_target is None
 
 
-def test_tilelang_backend_resolves_requested_target():
+@pytest.mark.parametrize("legacy_target_path", [False, True], ids=["current", "maca-0.1.9"])
+def test_tilelang_backend_resolves_requested_target(legacy_target_path):
     target_utils = SimpleNamespace(determine_target=mock.Mock(return_value="maca"))
+
+    def import_target(module):
+        if legacy_target_path and module == "tilelang.backend.target":
+            raise ModuleNotFoundError("No module named tilelang.backend", name="tilelang.backend")
+        return target_utils
 
     with (
         mock.patch.object(torch.cuda, "is_available", return_value=True),
         mock.patch.object(torch.version, "maca", "3.0", create=True),
-        mock.patch.object(backends.importlib, "import_module", return_value=target_utils),
+        mock.patch.object(backends.importlib, "import_module", side_effect=import_target) as import_module,
     ):
         config = backends.configure_backend("tilelang", "cuda:0", "maca")
 
+    expected_imports = [mock.call("tilelang.backend.target")]
+    if legacy_target_path:
+        expected_imports.append(mock.call("tilelang.utils.target"))
+    assert import_module.call_args_list == expected_imports
     target_utils.determine_target.assert_called_once_with("maca")
     assert config.target == "maca"
     assert config.tilelang_target == "maca"
+
+
+def test_tilelang_missing_dependency_does_not_try_legacy_target_path():
+    with (
+        mock.patch.object(torch.cuda, "is_available", return_value=True),
+        mock.patch.object(torch.version, "maca", "3.0", create=True),
+        mock.patch.object(
+            backends.importlib, "import_module",
+            side_effect=ModuleNotFoundError("No module named missing_dependency", name="missing_dependency"),
+        ) as import_module,
+        pytest.warns(RuntimeWarning, match="TileLang is unavailable.*using torch"),
+    ):
+        config = backends.configure_backend("tilelang", "cuda", "maca")
+
+    assert config.backend == "torch"
+    import_module.assert_called_once_with("tilelang.backend.target")
 
 
 @pytest.mark.parametrize("name", ["tilelang", "maca_cpp", "ninetoothed"])

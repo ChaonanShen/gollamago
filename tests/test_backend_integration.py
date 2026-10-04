@@ -10,6 +10,15 @@ import operators
 
 pytestmark = pytest.mark.accelerator
 
+# Llama-3.2-1B only: hidden=2048, Q/K heads=32/8, head_dim=64.
+# Include decode, prefill, and tails around RMSNorm rows=32 / RoPE B=4,S=64.
+LLAMA1B_BATCH_SEQUENCE = [
+    (1, 1), (2, 3), (2, 5), (4, 1), (5, 1), (8, 1),
+    (1, 31), (1, 32), (1, 33), (1, 63), (1, 64), (1, 65),
+    (4, 127), (4, 128), (5, 129), (2, 512),
+    (1, 2048), (1, 4096), (8, 1024),
+]
+
 
 def require_accelerator_tests():
     if os.environ.get("RUN_ACCELERATOR_TESTS") != "1":
@@ -35,7 +44,11 @@ def tilelang_device():
     return config.device
 
 
-@pytest.mark.parametrize("shape", [(1, 1, 2048), (2, 3, 2048)], ids=["single", "batched"])
+@pytest.mark.parametrize(
+    "shape",
+    [(batch, sequence, 2048) for batch, sequence in LLAMA1B_BATCH_SEQUENCE],
+    ids=[f"1b-b{batch}-s{sequence}" for batch, sequence in LLAMA1B_BATCH_SEQUENCE],
+)
 @pytest.mark.parametrize(
     "dtype,rtol,atol",
     [
@@ -64,8 +77,16 @@ def test_tilelang_rms_norm_on_detected_accelerator(tilelang_device, shape, dtype
 
 @pytest.mark.parametrize(
     "shape",
-    [(1, 1, 8, 64), (2, 5, 8, 64), (1, 1, 32, 64), (2, 5, 32, 64)],
-    ids=["key-single", "key-batched", "query-single", "query-batched"],
+    [
+        (batch, sequence, heads, 64)
+        for heads in (8, 32)
+        for batch, sequence in LLAMA1B_BATCH_SEQUENCE
+    ],
+    ids=[
+        f"1b-{'key' if heads == 8 else 'query'}-b{batch}-s{sequence}"
+        for heads in (8, 32)
+        for batch, sequence in LLAMA1B_BATCH_SEQUENCE
+    ],
 )
 @pytest.mark.parametrize(
     "dtype,tolerance",
@@ -83,6 +104,7 @@ def test_tilelang_rope_on_detected_accelerator(tilelang_device, shape, dtype, to
     sin = angles.sin().to(dtype)
     cos = angles.cos().to(dtype)
     before = input.clone()
+    sin_before, cos_before = sin.clone(), cos.clone()
 
     expected = operators.dispatch("rope", input, sin, cos, backend="torch")
     actual = operators.dispatch("rope", input, sin, cos, backend="tilelang")
@@ -92,14 +114,17 @@ def test_tilelang_rope_on_detected_accelerator(tilelang_device, shape, dtype, to
     assert actual.device == input.device
     torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
     torch.testing.assert_close(input, before, rtol=0, atol=0)
+    torch.testing.assert_close(sin, sin_before, rtol=0, atol=0)
+    torch.testing.assert_close(cos, cos_before, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("rotation", ["identity", "quarter-turn"])
-def test_tilelang_rope_special_rotations(tilelang_device, rotation):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16], ids=["float32", "float16", "bfloat16"])
+def test_tilelang_rope_special_rotations(tilelang_device, rotation, dtype):
     torch.manual_seed(0)
-    input = torch.randn(2, 3, 8, 64, device=tilelang_device)
-    sin = torch.full((3, 32), float(rotation == "quarter-turn"), device=tilelang_device)
-    cos = torch.full((3, 32), float(rotation == "identity"), device=tilelang_device)
+    input = torch.randn(5, 65, 8, 64, device=tilelang_device, dtype=dtype)
+    sin = torch.full((65, 32), float(rotation == "quarter-turn"), device=tilelang_device, dtype=dtype)
+    cos = torch.full((65, 32), float(rotation == "identity"), device=tilelang_device, dtype=dtype)
 
     expected = operators.dispatch("rope", input, sin, cos, backend="torch")
     actual = operators.dispatch("rope", input, sin, cos, backend="tilelang")

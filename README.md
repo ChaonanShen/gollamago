@@ -86,6 +86,10 @@ python infer.py --model models/Llama-3.2-1B --prompts "Hello" \
 
 TileLang测试：
 
+MACA 镜像应保留预装的 MACA PyTorch 和 TileLang，先检查依赖是否已经齐全；
+不要直接用 `requirements.txt` 中的 CUDA TileLang 版本覆盖镜像环境。
+后端兼容 TileLang 0.1.14 和 MACA 镜像的 0.1.9 target helper 路径。
+
 先加载预装的 TileLang 开发环境。脚本会自动发现 `/app/tilelang-metax`：
 
 ```shell
@@ -136,7 +140,38 @@ FP32/FP16/BF16，以及恒等旋转和 90 度旋转。TileLang RMSNorm 同样覆
 和三种精度，并检查输入及 weight 未被修改。MACA 和 NineToothed RMSNorm 测试也会检查注册并拒绝回退。
 未设置 `RUN_ACCELERATOR_TESTS=1` 时会跳过加速器测试。
 
-独立算子性能对比以 Llama-3.2-1B 为重点，默认先测 1B，再测 3B 和 8B（无需模型权重）：
+扩展正确性测试固定使用 1B 的 hidden=2048、Q/K heads=32/8、head_dim=64。
+共 177 个 TileLang 用例（RMSNorm 57、RoPE 114、特殊旋转 6），覆盖 FP32/FP16/BF16、
+19 组 batch/sequence，包括 31/32/33、63/64/65 等分块边界、batch=4/5、
+sequence=2048/4096 和 batch=8、sequence=1024。还检查输入、weight 和 RoPE table 未被修改。
+
+C500 16GB 上可按下面命令扩大独立算子性能测试范围；每个用例依次分配随机输入，无需模型权重。
+日志保存在仓库外；数值校验或后端回退失败会以非零状态退出。
+
+```shell
+mkdir -p /data/gollamago-data/logs
+(
+  set -e
+  for dtype in bfloat16 float16 float32; do
+    batches="1 8 32 64 128"
+    [ "$dtype" != float32 ] || batches="1 8 32 64"
+    for batch in $batches; do
+      python -m benchmarks.benchmark_operators --models llama3.2-1b \
+        --backend tilelang --target maca --dtype "$dtype" --batch-size "$batch" \
+        --seq-lens 128 512 2048 4906 \
+        --warmup 20 --repeat 200
+    done
+  done
+) > /data/gollamago-data/logs/llama1b-operators-expanded.log 2>&1
+```
+
+该命令共 168 组 RMSNorm / RoPE(Q) / RoPE(K) 对比。
+BF16/FP16 的 batch=1/8/32/64/128，FP32 的 batch=1/8/32/64。
+正确性和输入不变性检查采用分块比较，避免整份输出转换为 FP32 时产生大型临时张量；
+全部元素仍需通过相同的容差检查，计时部分保持不变。
+
+
+独立算子性能对比默认只测 Llama-3.2-1B；3B 和 8B 的代码保留，可通过 `--models` 显式选择（无需模型权重）：
 
 | 性能用例 | RMSNorm hidden_size | RoPE Q heads | RoPE K heads | head_dim |
 |---|---:|---:|---:|---:|
@@ -150,13 +185,13 @@ python -m benchmarks.benchmark_operators --backend tilelang --warmup 10 --repeat
 python -m benchmarks.benchmark_operators --models llama3.2-1b --warmup 10 --repeat 100
 # 仅测 RoPE，指定 batch、sequence 和精度：
 python -m benchmarks.benchmark_operators --models llama3.2-1b --operator rope --batch-size 4 \
-  --seq-lens 1 128 --dtype float16 --warmup 10 --repeat 100
+  --seq-lens 128 512 --dtype float16 --warmup 10 --repeat 100
 ```
 
 性能测试的张量尺寸、RMSNorm eps 和默认 BF16 来自上述模型配置；输入和 weight 仍是随机数据，
 不代表从模型抓取的真实 activation。RoPE table 复用 `llama.generate_sin_and_cos_tables`，
 与本项目的模型调用一致；本项目当前未应用 config.json 中的 rope_scaling。
-默认 batch=1、sequence=1/128/512/2048，分别测 RMSNorm、RoPE(Q) 和 RoPE(K)，共 36 组。
+默认 batch=1、sequence=128/512/2048/4906，分别测 RMSNorm、RoPE(Q) 和 RoPE(K)，1B 共 12 组。
 脚本先通过 dispatch 验证目标后端与 Torch 输出一致、输入未被修改，再分别预热和计时。
 输出模型名、张量尺寸、平均调用延迟（微秒）、`torch_time / backend_time` 加速比和最大绝对误差。
 JIT 编译和输入生成不计时；批量同步计时包含 dispatch、输出分配及 GPU 执行开销。
