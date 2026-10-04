@@ -136,6 +136,33 @@ FP32/FP16/BF16，以及恒等旋转和 90 度旋转。TileLang RMSNorm 同样覆
 和三种精度，并检查输入及 weight 未被修改。MACA 和 NineToothed RMSNorm 测试也会检查注册并拒绝回退。
 未设置 `RUN_ACCELERATOR_TESTS=1` 时会跳过加速器测试。
 
+独立算子性能对比以 Llama-3.2-1B 为重点，默认先测 1B，再测 3B 和 8B（无需模型权重）：
+
+| 性能用例 | RMSNorm hidden_size | RoPE Q heads | RoPE K heads | head_dim |
+|---|---:|---:|---:|---:|
+| [Llama-3.2-1B](https://modelscope.cn/models/LLM-Research/Llama-3.2-1B/resolve/master/config.json) | 2048 | 32 | 8 | 64 |
+| [Llama-3.2-3B](https://modelscope.cn/models/LLM-Research/Llama-3.2-3B/resolve/master/config.json) | 3072 | 24 | 8 | 128 |
+| [Llama-3.1-8B](https://modelscope.cn/models/LLM-Research/Meta-Llama-3.1-8B/resolve/master/config.json) | 4096 | 32 | 8 | 128 |
+
+```shell
+python -m benchmarks.benchmark_operators --backend tilelang --warmup 10 --repeat 100
+# 专注 Llama-3.2-1B，或用 --models 选择多个型号：
+python -m benchmarks.benchmark_operators --models llama3.2-1b --warmup 10 --repeat 100
+# 仅测 RoPE，指定 batch、sequence 和精度：
+python -m benchmarks.benchmark_operators --models llama3.2-1b --operator rope --batch-size 4 \
+  --seq-lens 1 128 --dtype float16 --warmup 10 --repeat 100
+```
+
+性能测试的张量尺寸、RMSNorm eps 和默认 BF16 来自上述模型配置；输入和 weight 仍是随机数据，
+不代表从模型抓取的真实 activation。RoPE table 复用 `llama.generate_sin_and_cos_tables`，
+与本项目的模型调用一致；本项目当前未应用 config.json 中的 rope_scaling。
+默认 batch=1、sequence=1/128/512/2048，分别测 RMSNorm、RoPE(Q) 和 RoPE(K)，共 36 组。
+脚本先通过 dispatch 验证目标后端与 Torch 输出一致、输入未被修改，再分别预热和计时。
+输出模型名、张量尺寸、平均调用延迟（微秒）、`torch_time / backend_time` 加速比和最大绝对误差。
+JIT 编译和输入生成不计时；批量同步计时包含 dispatch、输出分配及 GPU 执行开销。
+Torch baseline 是本仓库的 eager 参考实现；其多次 kernel 启动与中间张量开销也包含在计时内。
+算子未注册或回退时直接失败。
+
 下面提供轻量性能对比，统一生成 16 个 token，使用 1 次 warmup、3 次测量，并保持模型、
 prompt、seed、精度和设备完全一致。该配置用于快速反馈，结果波动较大，不作为正式性能结论。
 下面命令假设在 MACA 机器上运行，模型目录是 `models/Llama-3.2-1B`。
