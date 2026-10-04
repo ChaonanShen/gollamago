@@ -37,7 +37,8 @@ def _compile_rms_norm(columns: int, eps: float, dtype: str, target: str):
     import tilelang.language as T
 
     rows = T.dynamic("rows")
-    block_columns = 512
+    block_columns = 512 # 感觉最好就是不要column分块
+    block_rows = 32 # 一个block处理block_rows行
 
     @tilelang.jit(target=target, out_idx=[-1])
     def kernel():
@@ -47,33 +48,36 @@ def _compile_rms_norm(columns: int, eps: float, dtype: str, target: str):
             weight: T.Tensor((columns,), dtype),
             output: T.Tensor((rows, columns), dtype),
         ):
-            # TODO: 一个block就处理一行？
-            with T.Kernel(rows, threads=128) as row:
-                input_shared = T.alloc_shared((block_columns,), dtype)
-                square_fragment = T.alloc_fragment((block_columns,), T.float32)
-                square_sum = T.alloc_fragment((1,), T.float32)
-                mean = T.alloc_fragment((1,), dtype)
-                inverse_rms = T.alloc_fragment((1,), dtype)
+            with T.Kernel(T.ceildiv(rows, block_rows), threads=128) as br:
+                row = br * block_rows
+
+                input_shared = T.alloc_shared((block_rows, block_columns), dtype)
+                square_fragment = T.alloc_fragment((block_rows, block_columns), T.float32)
+                square_sum = T.alloc_fragment((block_rows,), T.float32)
+                mean = T.alloc_fragment((block_rows,), dtype)
+                inverse_rms = T.alloc_fragment((block_rows,), dtype)
 
                 T.clear(square_fragment)
-                for chunk in range(T.ceildiv(columns, block_columns)):
-                    T.copy(input[row, chunk * block_columns], input_shared)
-                    for offset in T.Parallel(block_columns):
-                        square_fragment[offset] += (
-                            input_shared[offset] * input_shared[offset]
-                        )
+                for chunk in T.Serial(T.ceildiv(columns, block_columns)):
+                    for i, j in T.Parallel(block_rows, block_columns):
+                        T.copy(input[row+i, chunk*block_columns+j], input_shared[i, j])
+                    for i, j in T.Parallel(block_rows, block_columns):
+                        square_fragment[i, j] += input_shared[i, j] * input_shared[i, j]
 
-                T.reduce_sum(square_fragment, square_sum, dim=0)
-                mean[0] = square_sum[0] / columns
-                inverse_rms[0] = T.rsqrt(mean[0] + eps)
+                T.reduce_sum(square_fragment, square_sum, dim=1)
+                for i in T.Parallel(block_rows):
+                    mean[i] = square_sum[i] / columns
+                    inverse_rms[i] = T.rsqrt(mean[i] + eps)
 
-                for chunk in range(T.ceildiv(columns, block_columns)):
-                    for offset in T.Parallel(block_columns):
-                        index = chunk * block_columns + offset
-                        if index < columns:
-                            output[row, index] = T.cast(
-                                input[row, index] * inverse_rms[0], dtype
-                            ) * weight[index]
+                # 这里怎么又直接input中读取，不先读入一个缓存吗？
+                for chunk in T.Serial(T.ceildiv(columns, block_columns)):
+                    for i, j in T.Parallel(block_rows, block_columns):
+                        row_index = row + i
+                        col_index = chunk * block_columns + j
+                        if row_index < rows and col_index < columns:
+                            output[row_index, col_index] = T.cast(
+                                input[row_index, col_index] * inverse_rms[i], dtype
+                            ) * weight[col_index]
 
         return main
 
