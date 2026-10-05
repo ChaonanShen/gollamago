@@ -81,12 +81,12 @@ def test_tilelang_rms_norm_on_detected_accelerator(tilelang_device, shape, dtype
         (batch, sequence, heads, 64)
         for heads in (8, 32)
         for batch, sequence in LLAMA1B_BATCH_SEQUENCE
-    ],
+    ] + [(2, 5, 3, 64), (3, 7, 5, 128), (1, 1, 24, 128)],
     ids=[
         f"1b-{'key' if heads == 8 else 'query'}-b{batch}-s{sequence}"
         for heads in (8, 32)
         for batch, sequence in LLAMA1B_BATCH_SEQUENCE
-    ],
+    ] + ["tail-h3-d64", "tail-h5-d128", "decode-h24-d128"],
 )
 @pytest.mark.parametrize(
     "dtype,tolerance",
@@ -163,3 +163,22 @@ def test_ninetoothed_rms_norm_on_mxmaca():
     expected = operators.dispatch("rms_norm", input, weight, 1e-5, backend="torch")
 
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.07)
+
+
+@pytest.mark.parametrize("sequence", [0, 3])
+def test_tilelang_rope_table_prefix_and_empty_input(tilelang_device, sequence):
+    input = torch.randn(2, sequence, 3, 64, device=tilelang_device, dtype=torch.float32)
+    angles = torch.randn(sequence + 5, 32, device=tilelang_device)
+    sin, cos = angles.sin(), angles.cos()
+    expected = operators.dispatch("rope", input, sin, cos, backend="torch")
+    actual = operators.dispatch("rope", input, sin, cos, backend="tilelang")
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_tilelang_rope_rejects_short_tables(tilelang_device):
+    from operators.tilelang_ops import rope
+
+    input = torch.randn(2, 5, 3, 64, device=tilelang_device)
+    table = torch.ones(4, 32, device=tilelang_device)
+    with pytest.raises(ValueError, match="too short"):
+        rope(input, table, table)

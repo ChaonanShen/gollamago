@@ -95,70 +95,86 @@ def rms_norm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Ten
 register_operator("tilelang", "rms_norm", rms_norm)
 
 @functools.lru_cache(maxsize=None)
-def _compile_rope(heads: int, head_dim: int, dtype: str, target: str):
-    # llama3.2-1B的head_dim=64
-    # 所以分块可以更多些，每行处理BR, BS
+def _compile_rope(
+    heads: int, head_dim: int, dtype: str, target: str, block_rows: int | None = None,
+):
+    import tilelang
+    import tilelang.language as T
 
-    import tilelang 
-    import tilelang.language as T 
+    # A6000 sweep: 16 rows for D=64, 4 rows for D=128 across BF16/FP16/FP32.
+    # Keep an explicit override for tuning; these defaults are not C500 measurements.
+    if block_rows is None:
+        block_rows = 4 if head_dim >= 128 else 16
 
-    B = T.dynamic("B")
-    S = T.dynamic("S")
-
-    BR = 1  # Limit live FP32 fragment data per block.
-    BS = 64
+    batch = T.dynamic("batch")
+    sequence = T.dynamic("sequence")
+    rows = batch * sequence * heads
+    half = head_dim // 2
 
     @tilelang.jit(target=target, out_idx=[-1])
     def kernel():
-        @T.prim_func 
+        @T.prim_func
         def main(
-            input: T.Tensor((B, S, heads, head_dim), dtype), # (B, S, H, D)
-            sin_table: T.Tensor((S, head_dim//2), dtype),
-            cos_table: T.Tensor((S, head_dim//2), dtype),
-            output: T.Tensor((B, S, heads, head_dim), dtype)
+            input: T.Tensor((batch, sequence, heads, head_dim), dtype),
+            sin_table: T.Tensor((sequence, half), dtype),
+            cos_table: T.Tensor((sequence, half), dtype),
+            output: T.Tensor((batch, sequence, heads, head_dim), dtype),
         ):
-            with T.Kernel(T.ceildiv(B, BR), T.ceildiv(S, BS), heads, threads=128) as (br, bs, h):
-                r = br * BR 
-                s = bs * BS 
-                
-                first_half = T.alloc_fragment((BR, BS, head_dim//2,), T.float32)
-                second_half = T.alloc_fragment((BR, BS, head_dim//2,), T.float32)
+            # Buffer aliases flatten indexing without Python tensor views or copies.
+            input_flat = T.reshape(input, (rows, head_dim))
+            output_flat = T.reshape(output, (rows, head_dim))
+            with T.Kernel(T.ceildiv(rows, block_rows), threads=128) as br:
+                row_start = br * block_rows
+                first_half = T.alloc_fragment((block_rows, half), T.float32)
+                second_half = T.alloc_fragment((block_rows, half), T.float32)
 
-                # 复制
-                for i, j, d in T.Parallel(BR, BS, head_dim//2):
-                    first_half[i, j, d] = input[r+i, s+j, h, d]
-                    second_half[i, j, d] = input[r+i, s+j, h, d+head_dim//2]
+                for i, d in T.Parallel(block_rows, half):
+                    if row_start + i < rows:
+                        first_half[i, d] = input_flat[row_start + i, d]
+                        second_half[i, d] = input_flat[row_start + i, d + half]
 
-                # 计算
-                for i, j, d in T.Parallel(BR, BS, head_dim//2):
-                    # 每一行D，乘以各自位置的sin/cos就行
-                    sin = T.cast(sin_table[s+j, d], T.float32)
-                    cos = T.cast(cos_table[s+j, d], T.float32)
-                    first = first_half[i, j, d]
-                    second = second_half[i, j, d]
-                    first_half[i, j, d] = first * cos - second * sin
-                    second_half[i, j, d] = first * sin + second * cos
+                for i, d in T.Parallel(block_rows, half):
+                    if row_start + i < rows:
+                        # row = (batch_idx * sequence + seq_pos) * heads + head_idx
+                        seq_pos = ((row_start + i) // heads) % sequence
+                        sin = T.cast(sin_table[seq_pos, d], T.float32)
+                        cos = T.cast(cos_table[seq_pos, d], T.float32)
+                        first = first_half[i, d]
+                        second = second_half[i, d]
+                        first_half[i, d] = first * cos - second * sin
+                        second_half[i, d] = first * sin + second * cos
 
-                for i, j, d in T.Parallel(BR, BS, head_dim//2):
-                    output[r+i, s+j, h, d] = first_half[i, j, d]
-                    output[r+i, s+j, h, d+head_dim//2] = second_half[i, j, d]
+                for i, d in T.Parallel(block_rows, half):
+                    if row_start + i < rows:
+                        output_flat[row_start + i, d] = first_half[i, d]
+                        output_flat[row_start + i, d + half] = second_half[i, d]
 
         return main
-    
+
     return kernel()
 
 # rms_norm是attention/mlp之前做的，还没分heads
 # rope是attention之中做的，已经分了heads
 
 def rope(input: torch.Tensor, sin_table: torch.Tensor, cos_table: torch.Tensor) -> torch.Tensor:
-    # input: [B, S, H, D], sin_table: [S, D//2]
-    H, D = input.shape[-2], input.shape[-1]
-    if D % 2 != 0:
-        raise ValueError("ROPE dimension size should be even")
-    if D != sin_table.shape[-1] * 2 or D != cos_table.shape[-1] * 2:
+    # The kernel aliases contiguous [B, S, H, D] as [B*S*H, D].
+    _, sequence, H, D = input.shape
+    if D <= 0 or D % 2 != 0:
+        raise ValueError("ROPE dimension size should be positive and even")
+    if sin_table.ndim != 2 or cos_table.ndim != 2:
+        raise ValueError("RoPE tables must be two-dimensional")
+    if D != sin_table.shape[1] * 2 or D != cos_table.shape[1] * 2:
         raise ValueError("ROPE dimension size mismatch")
+    if sin_table.shape[0] < sequence or cos_table.shape[0] < sequence:
+        raise ValueError("RoPE tables are too short for the input sequence")
     if not input.is_contiguous():
         raise ValueError("TileLang rope expects contiguous tensors")
+    if input.numel() == 0:
+        return torch.empty_like(input)
+    if sin_table.shape[0] > sequence:
+        sin_table = sin_table[:sequence]
+    if cos_table.shape[0] > sequence:
+        cos_table = cos_table[:sequence]
     kernel = _compile_rope(H, D, _tilelang_dtype(input.dtype), _target())
     return kernel(input, sin_table, cos_table)
 
