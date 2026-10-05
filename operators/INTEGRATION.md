@@ -131,16 +131,33 @@ from . import maca_kernels
 register_operator("maca_cpp", "my_op", maca_kernels.my_op)
 ```
 
-RoPE 的 `maca_cpp` 注册槽位也已预置。当前没有 `maca_kernels.rope` 时自动使用 PyTorch；
-学员只需完成两件事：
+RoPE 已接入 BF16 原生实现，文件位于 `src/rope/rope.maca`，构建脚本会自动编译。
+输入为 contiguous `[batch, sequence, heads, head_dim]`；两个 table 为 contiguous
+`[table_sequence >= sequence, head_dim / 2]`，所有张量须在同一 MACA device 上。
+kernel 展平前三维，一个 block 处理多行，每个线程旋转前后半维度的一对元素；
+输出使用 FP32 中间计算后舍入到 BF16，因此与 eager Torch 的 BF16 中间舍入不保证逐位一致。
 
-1. 在 `src/rope.maca` 实现 kernel 和 launch 函数。`setup.py` 会自动发现该文件并编译，
-   不需要修改构建脚本。
-2. 在 `bindings.cpp` 增加 `extern` 声明、参数检查、输出分配和 Python 绑定
-   `module.def("rope", &rope, "MXMACA RoPE")`。重新构建后，`__init__.py` 会自动发现
-   `maca_kernels.rope`，不需要修改注册代码。
+模型仍使用三个张量参数。C500 16 GiB 切片上联合扫描的默认配置为 D=64 时 8 行/256 线程，
+D=128 时 4 行/256 线程；其他宽度沿用相近布局。独立实验时可显式覆盖：
 
-本仓库不提供 `rope.maca` 的实现，学员只需填写上述 kernel 和 binding 部分。
+```python
+from operators.maca_cpp import maca_kernels
+output = maca_kernels.rope(input, sin_table, cos_table, block_rows=4, threads=128)
+```
+
+`block_rows=0`、`threads=0` 表示自动选择；显式行数允许 1–1024，线程数允许
+64–1024 中的 64 的倍数。D=64/128 使用专用 kernel，其他正偶数宽度使用通用路径。
+C500 的配置扫描（结果保存在仓库外）：
+
+```shell
+python -m benchmarks.tune_maca_rope \
+  --output /data/gollamago-data/rope-tuning/sweep.json
+RUN_ACCELERATOR_TESTS=1 python -m pytest -q tests/test_maca_rope.py
+```
+
+扫描先检查每个候选的正确性，再用 CUDA Graph 测量 GPU 执行时间；
+完整调用时间另行测量，包含输出分配和 Python/C++ 调用。最佳配置依输入大小与设备变化，
+可用 `--block-rows` 和 `--threads` 调整候选列表。
 
 构建和验证：
 
