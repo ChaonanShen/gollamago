@@ -37,44 +37,44 @@ def _compile_rms_norm(columns: int, eps: float, dtype: str, target: str):
     import tilelang.language as T
 
     rows = T.dynamic("rows")
-    block_rows = 1
-    threads = 64  # One C500 warp reduces one complete row.
+    threads = 64
 
     @tilelang.jit(target=target, out_idx=[-1])
     def kernel():
         @T.prim_func
         def main(
-            input: T.Tensor((rows, columns), dtype), # (B*S, D)
+            input: T.Tensor((rows, columns), dtype),
             weight: T.Tensor((columns,), dtype),
             output: T.Tensor((rows, columns), dtype),
         ):
-            with T.Kernel(T.ceildiv(rows, block_rows), threads=threads) as br:
-                row = br * block_rows
+            with T.Kernel(rows, threads=threads) as row:
+                input_fragment = T.alloc_fragment((1, columns), dtype)
+                weight_fragment = T.alloc_fragment((columns,), dtype)
+                square_sum = T.alloc_reducer(
+                    (1,), T.float32, op="sum", replication="all",
+                )
+                mean = T.alloc_fragment((1,), dtype)
+                inverse_rms = T.alloc_fragment((1,), dtype)
 
-                input_shared = T.alloc_shared((block_rows, columns), dtype)
-                square_fragment = T.alloc_fragment((block_rows, columns), T.float32)
-                square_sum = T.alloc_fragment((block_rows,), T.float32)
-                mean = T.alloc_fragment((block_rows,), dtype)
-                inverse_rms = T.alloc_fragment((block_rows,), dtype)
-                weight_local = T.alloc_fragment((columns,), dtype)
+                T.copy(input[row:row + 1, :], input_fragment)
+                T.copy(weight, weight_fragment)
 
-                T.copy(weight, weight_local)
+                # Accumulate square contributions without a full square buffer.
+                T.clear(square_sum)
+                for i, j in T.Parallel(1, columns):
+                    value = T.cast(input_fragment[i, j], T.float32)
+                    square_sum[i] += value * value
+                T.finalize_reducer(square_sum)
 
-                T.clear(square_fragment)
-                for i, j in T.Parallel(block_rows, columns):
-                    T.copy(input[row+i, j], input_shared[i, j])
-                for i, j in T.Parallel(block_rows, columns):
-                    tmp = T.cast(input_shared[i, j], T.float32)
-                    square_fragment[i, j] = tmp * tmp
-
-                T.reduce_sum(square_fragment, square_sum, dim=1)
-                for i in T.Parallel(block_rows):
+                for i in T.Parallel(1):
                     mean[i] = square_sum[i] / columns
                     inverse_rms[i] = T.rsqrt(mean[i] + eps)
 
-                for i, j in T.Parallel(block_rows, columns):
-                    if row+i < rows:
-                        output[row+i, j] = T.cast(input_shared[i, j], T.float32) * inverse_rms[i] * weight_local[j]
+                for i, j in T.Parallel(1, columns):
+                    value = T.cast(input_fragment[i, j], T.float32)
+                    inv = T.cast(inverse_rms[i], T.float32)
+                    scale = T.cast(weight_fragment[j], T.float32)
+                    output[row + i, j] = value * inv * scale
 
         return main
 
