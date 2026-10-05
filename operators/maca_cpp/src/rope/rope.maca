@@ -1,14 +1,74 @@
-// MXMACA RoPE kernel exercise.
-// The launch entry point is intentionally a stub. Implement the device kernel
-// and replace the return value once the kernel is ready.
+#include <common/maca_bfloat16.h>
+#include <mc_runtime.h>
+
 #include <cstdint>
 
+namespace {
+
+// A row is one head vector in contiguous [batch, sequence, heads, head_dim].
+// Each thread rotates a pair from the first and second halves of that vector.
+template <int HeadDim>
+__global__ void rope_bf16_kernel(const maca_bfloat16* input,
+                                 const maca_bfloat16* sin_table,
+                                 const maca_bfloat16* cos_table,
+                                 maca_bfloat16* output,
+                                 int64_t rows, int64_t sequence, int64_t heads,
+                                 int64_t head_dim, int block_rows) {
+  const int64_t half = HeadDim == 0 ? head_dim / 2 : HeadDim / 2;
+  const int64_t dim = HeadDim == 0 ? head_dim : HeadDim;
+  const int64_t row_start = static_cast<int64_t>(blockIdx.x) * block_rows;
+  for (int64_t pair = threadIdx.x; pair < block_rows * half;
+       pair += blockDim.x) {
+    const int64_t row = row_start + pair / half;
+    if (row < rows) {
+      const int64_t d = pair % half;
+      const int64_t seq_pos = (row / heads) % sequence;
+      const int64_t input_offset = row * dim + d;
+      const int64_t table_offset = seq_pos * half + d;
+      const float first = __bfloat162float(input[input_offset]);
+      const float second = __bfloat162float(input[input_offset + half]);
+      const float sin = __bfloat162float(sin_table[table_offset]);
+      const float cos = __bfloat162float(cos_table[table_offset]);
+      // FP32 arithmetic, followed by one BF16 rounding per output.
+      output[input_offset] = __float2bfloat16_rn(first * cos - second * sin);
+      output[input_offset + half] = __float2bfloat16_rn(first * sin + second * cos);
+    }
+  }
+}
+
+}  // namespace
+
 extern "C" int launch_rope_bf16(const void* input, const void* sin_table,
-                                  const void* cos_table, void* output,
-                                  int64_t batch, int64_t sequence, int64_t heads,
-                                  int64_t head_dim, void* stream) {
-  (void)input; (void)sin_table; (void)cos_table; (void)output;
-  (void)batch; (void)sequence; (void)heads; (void)head_dim; (void)stream;
-  // TODO(student): launch the MXMACA RoPE device kernel here.
-  return 1;
+                                 const void* cos_table, void* output,
+                                 int64_t batch, int64_t sequence, int64_t heads,
+                                 int64_t head_dim, int block_rows, int threads,
+                                 void* stream) {
+  const int64_t rows = batch * sequence * heads;
+  if (rows == 0) {
+    return static_cast<int>(mcSuccess);
+  }
+  if (block_rows <= 0 || threads <= 0 || threads > 1024 ||
+      head_dim <= 0 || head_dim % 2 != 0) {
+    return static_cast<int>(mcErrorInvalidValue);
+  }
+  // Discard an earlier, handled runtime error; report this launch's error below.
+  (void)mcGetLastError();
+  const unsigned int blocks =
+      static_cast<unsigned int>((rows + block_rows - 1) / block_rows);
+  const auto maca_stream = reinterpret_cast<mcStream_t>(stream);
+  const auto* x = static_cast<const maca_bfloat16*>(input);
+  const auto* sin = static_cast<const maca_bfloat16*>(sin_table);
+  const auto* cos = static_cast<const maca_bfloat16*>(cos_table);
+  auto* y = static_cast<maca_bfloat16*>(output);
+  if (head_dim == 64) {
+    rope_bf16_kernel<64><<<blocks, threads, 0, maca_stream>>>(
+        x, sin, cos, y, rows, sequence, heads, head_dim, block_rows);
+  } else if (head_dim == 128) {
+    rope_bf16_kernel<128><<<blocks, threads, 0, maca_stream>>>(
+        x, sin, cos, y, rows, sequence, heads, head_dim, block_rows);
+  } else {
+    rope_bf16_kernel<0><<<blocks, threads, 0, maca_stream>>>(
+        x, sin, cos, y, rows, sequence, heads, head_dim, block_rows);
+  }
+  return static_cast<int>(mcGetLastError());
 }
