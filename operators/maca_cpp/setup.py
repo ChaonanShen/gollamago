@@ -58,6 +58,8 @@ class MXMACABuildExtension(BuildExtension):
                 objects.append(str(optional_object))
         for extension in self.extensions:
             extension.extra_objects = [*getattr(extension, "extra_objects", []), *objects]
+            # Fresh .maca objects must trigger relinking even when bindings.cpp is unchanged.
+            extension.depends = [*getattr(extension, "depends", []), *objects]
         super().build_extensions()
 
 

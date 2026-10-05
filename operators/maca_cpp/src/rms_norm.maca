@@ -77,6 +77,9 @@ __global__ void rms_norm_bf16_kernel(const maca_bfloat16* input,
 
   for (int offset = threadIdx.x; offset < kReductionWidth; offset += blockDim.x) {
     float square_sum = 0.0f;
+    // 目前D=2048，所以chunk就是0,1,2,3取值，offset是0->512->1024->...(thread0)
+    // thread0读0,512,1024,1536,2048 -> 128+[0,512,1024,1536,2048]->....
+    // 就这样一个128 threads的block，读完2048个数字，形成512个reduce结果(每个thread读16个)
     for (int64_t chunk = 0; chunk * kReductionWidth < columns; ++chunk) {
       const int64_t column = chunk * kReductionWidth + offset;
       if (column < columns) {
@@ -127,6 +130,8 @@ extern "C" int launch_rms_norm_bf16(const void* input,
   if (rows == 0) {
     return static_cast<int>(mcSuccess);
   }
+  // Discard an earlier, handled runtime error; report this launch's error below.
+  (void)mcGetLastError();
   // 只对验证过的 D=2048 使用专用缓存布局；其他宽度继续走原通用实现。
   if (columns == kCachedColumns) {
     rms_norm_bf16_cached_2048_kernel<<<
