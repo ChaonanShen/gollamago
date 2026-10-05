@@ -1,4 +1,4 @@
-"""TileLang RMSNorm example."""
+"""TileLang RMSNorm and RoPE kernels."""
 
 import functools
 import warnings
@@ -29,7 +29,7 @@ def _target() -> str:
         raise RuntimeError("TileLang operator called without an active TileLang backend")
     return config.target
 
-# 还要特别注意一点，在C500中一些参数可能不一样，要细调下
+# Defaults measured on MetaX C500 with Llama-3.2-1B BF16 shapes.
 
 @functools.lru_cache(maxsize=None)
 def _compile_rms_norm(columns: int, eps: float, dtype: str, target: str):
@@ -37,7 +37,8 @@ def _compile_rms_norm(columns: int, eps: float, dtype: str, target: str):
     import tilelang.language as T
 
     rows = T.dynamic("rows")
-    block_rows = 16 # 一个block处理block_rows行，处理(block_rows, columns)小块
+    block_rows = 1
+    threads = 64  # One C500 warp reduces one complete row.
 
     @tilelang.jit(target=target, out_idx=[-1])
     def kernel():
@@ -47,15 +48,15 @@ def _compile_rms_norm(columns: int, eps: float, dtype: str, target: str):
             weight: T.Tensor((columns,), dtype),
             output: T.Tensor((rows, columns), dtype),
         ):
-            with T.Kernel(T.ceildiv(rows, block_rows), threads=128) as br:
+            with T.Kernel(T.ceildiv(rows, block_rows), threads=threads) as br:
                 row = br * block_rows
 
                 input_shared = T.alloc_shared((block_rows, columns), dtype)
                 square_fragment = T.alloc_fragment((block_rows, columns), T.float32)
                 square_sum = T.alloc_fragment((block_rows,), T.float32)
-                mean = T.alloc_fragment((block_rows,), T.float32)
-                inverse_rms = T.alloc_fragment((block_rows,), T.float32)
-                weight_local = T.alloc_fragment((columns,), T.float32)
+                mean = T.alloc_fragment((block_rows,), dtype)
+                inverse_rms = T.alloc_fragment((block_rows,), dtype)
+                weight_local = T.alloc_fragment((columns,), dtype)
 
                 T.copy(weight, weight_local)
 
@@ -72,7 +73,7 @@ def _compile_rms_norm(columns: int, eps: float, dtype: str, target: str):
 
                 for i, j in T.Parallel(block_rows, columns):
                     if row+i < rows:
-                        output[row+i, j] = input_shared[i, j] * inverse_rms[i] * weight_local[j]
+                        output[row+i, j] = T.cast(input_shared[i, j], T.float32) * inverse_rms[i] * weight_local[j]
 
         return main
 
@@ -103,7 +104,7 @@ def _compile_rope(heads: int, head_dim: int, dtype: str, target: str):
     B = T.dynamic("B")
     S = T.dynamic("S")
 
-    BR = 4 # 一个block处理BR行 
+    BR = 1  # Limit live FP32 fragment data per block.
     BS = 64
 
     @tilelang.jit(target=target, out_idx=[-1])
