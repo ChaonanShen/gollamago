@@ -8,6 +8,65 @@ namespace {
 constexpr int kNormThreads = 128;
 constexpr int kReductionWidth = 512;
 
+constexpr int kCachedThreads = 64;
+constexpr int kCachedColumns = 2048;
+constexpr int kValuesPerThread = kCachedColumns / kCachedThreads;
+
+// D=2048 专用路径：旧版使用 128 线程和 512 个 shared memory 部分和。
+// C500 的 warp 宽度为 64，这里用一个 warp 处理一行，每线程负责 32 个元素，
+// 使整行归约只需 warp 内通信，不再需要跨 warp 的 shared memory 和 block barrier。
+__global__ void rms_norm_bf16_cached_2048_kernel(
+    const maca_bfloat16* input,
+    const maca_bfloat16* weight,
+    maca_bfloat16* output,
+    float eps) {
+  const int tid = threadIdx.x;
+  const int64_t row_offset =
+      static_cast<int64_t>(blockIdx.x) * kCachedColumns;
+  // 固定长度缓存 + 展开循环，让数组索引在编译期确定，便于寄存器分配。
+  // 输入第一次读取后保留到输出阶段，省掉旧版的第二次 global memory 读取。
+  float values[kValuesPerThread];
+  // 边计算平方边累加，每线程只保留一个部分和，不保存逐元素平方数组。
+  float square_sum = 0.0f;
+
+#pragma unroll
+  for (int k = 0; k < kValuesPerThread; ++k) {
+    // 同一轮中，相邻线程访问相邻列，保持合并访存。
+    const int column = k * kCachedThreads + tid;
+    const float value = __bfloat162float(input[row_offset + column]);
+    values[k] = value;
+    // 平方使用 FP32，不再像旧版一样先舍入为 BF16 后才累加。
+    square_sum += value * value;
+  }
+
+  // 64 个 lane 无条件参与 XOR butterfly：32、16、8、4、2、1，共 6 轮。
+  // 每个 lane 最终都得到整行平方和，无需 shared memory、__syncthreads()
+  // 或额外的结果广播；完整 64-bit mask 与 C500 的 64-lane warp 对应。
+  constexpr uint64_t kFullWarpMask = 0xffffffffffffffffULL;
+#pragma unroll
+  for (int delta = kCachedThreads / 2; delta > 0; delta >>= 1) {
+    square_sum += __shfl_xor_sync(kFullWarpMask, square_sum, delta,
+                                 kCachedThreads);
+  }
+
+  // mean 和 inverse_rms 仍沿用 BF16 存储；FP32 中间计算不保证与旧版逐位一致。
+  const maca_bfloat16 mean =
+      __float2bfloat16_rn(square_sum / static_cast<float>(kCachedColumns));
+  const maca_bfloat16 inverse_rms =
+      __float2bfloat16_rn(rsqrtf(__bfloat162float(mean) + eps));
+  const float inv = __bfloat162float(inverse_rms);
+
+#pragma unroll
+  for (int k = 0; k < kValuesPerThread; ++k) {
+    const int column = k * kCachedThreads + tid;
+    const float scale = __bfloat162float(weight[column]);
+    // 复用缓存的输入，normalized 保持 FP32，最终乘 weight 后才转 BF16。
+    // 省掉旧版 normalized 的 BF16 舍入/转换；按 BF16 benchmark 容差验证。
+    const float normalized = values[k] * inv;
+    output[row_offset + column] = __float2bfloat16_rn(normalized * scale);
+  }
+}
+
 __global__ void rms_norm_bf16_kernel(const maca_bfloat16* input,
                                      const maca_bfloat16* weight,
                                      maca_bfloat16* output,
@@ -68,10 +127,21 @@ extern "C" int launch_rms_norm_bf16(const void* input,
   if (rows == 0) {
     return static_cast<int>(mcSuccess);
   }
-  rms_norm_bf16_kernel<<<static_cast<unsigned int>(rows), kNormThreads, 0,
-                         reinterpret_cast<mcStream_t>(stream)>>>(
-      static_cast<const maca_bfloat16*>(input),
-      static_cast<const maca_bfloat16*>(weight),
-      static_cast<maca_bfloat16*>(output), columns, eps);
+  // 只对验证过的 D=2048 使用专用缓存布局；其他宽度继续走原通用实现。
+  if (columns == kCachedColumns) {
+    rms_norm_bf16_cached_2048_kernel<<<
+        static_cast<unsigned int>(rows), kCachedThreads, 0,
+        reinterpret_cast<mcStream_t>(stream)>>>(
+            static_cast<const maca_bfloat16*>(input),
+            static_cast<const maca_bfloat16*>(weight),
+            static_cast<maca_bfloat16*>(output), eps);
+  } else {
+    // Preserve support for other widths through the existing generic kernel.
+    rms_norm_bf16_kernel<<<static_cast<unsigned int>(rows), kNormThreads, 0,
+                           reinterpret_cast<mcStream_t>(stream)>>>(
+        static_cast<const maca_bfloat16*>(input),
+        static_cast<const maca_bfloat16*>(weight),
+        static_cast<maca_bfloat16*>(output), columns, eps);
+  }
   return static_cast<int>(mcGetLastError());
 }

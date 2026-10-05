@@ -145,7 +145,8 @@ def test_maca_cpp_rms_norm_on_mxmaca():
     actual = operators.dispatch("rms_norm", input, weight, 1e-5, backend="maca_cpp")
     expected = operators.dispatch("rms_norm", input, weight, 1e-5, backend="torch")
 
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # FP32 square/normalization intermediates use the BF16 benchmark tolerance.
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=7e-2)
 
 
 def test_ninetoothed_rms_norm_on_mxmaca():
